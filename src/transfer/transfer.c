@@ -389,7 +389,14 @@ void tr_tick(struct transfer *t){
     int need_relay=1;
     for(int id=1;id<=4;id++)if(id!=t->id && t->peers[id].info.used){
         struct peer *p=&t->peers[id];
-        if(!t->mode && t->id<id && !link_for(t,id) && now>=p->retry_connect){p->retry_connect=now+2;dial(t,id,p->info.priv_ip_n,p->info.tcp_port_h,0);}
+        if(!t->mode && t->id<id && !link_for(t,id) && now>=p->retry_connect){
+            p->retry_connect=now+2;
+            /* Same as UDP path: when priv is WSL-only but reflection is on the hotspot,
+               dial the reachable reflex IPv4 (tcp_port, not refl UDP port). */
+            uint32_t dip=p->info.priv_ip_n;
+            if(p->info.refl_ip_n && p->info.refl_ip_n!=dip)dip=p->info.refl_ip_n;
+            dial(t,id,dip,p->info.tcp_port_h,0);
+        }
         if(t->mode==2 || (!route(t,id) && now-p->route_since>=8))p->fallback=1;
         if(p->fallback)need_relay=1;
         int path=route(t,id);
