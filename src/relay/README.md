@@ -21,4 +21,4 @@
 
 ## 2026-10-25 收发整合补丁
 
-正式入口仅 `relay_server`。读取和发送队列使用公共 `fa_stream`，保留 room=1 与名单检查。`evidence_queued` 表示成功入队的 PIECE_DATA 数据区累计（可能含重传）。说明见 [`docs/传块模块.md`](../../docs/传块模块.md)。
+正式入口仅 `relay_server`。读取和发送队列使用公共 `fa_stream`，保留 room=1 与名单检查。`evidence_queued` 表示成功入队的 PIECE_DATA 数据区累计（可能含重传）。说明见 [`docs/模块说明.md`](../../docs/模块说明.md)。

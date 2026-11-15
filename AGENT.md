@@ -42,9 +42,9 @@
 
 ## 本机开发与文档
 
-- Windows 开发机：默认 **WSL2 + Ubuntu**，路径 `/mnt/d/.../Project`，`make` 构建；见 `docs/构建说明.md`。  
+- Windows 开发机：默认 **WSL2 + Ubuntu**，路径 `/mnt/d/.../Project`，`make` 构建；见 `docs/构建与演示.md`。  
 - 源码按 **Linux POSIX** 维护，不在此仓库做 MSYS2/原生 Windows 编译主线。  
-- 文档地图：`docs/README.md`。进度状态：`docs/验收总表.md`。
+- 文档地图：`docs/README.md`。进度状态：`docs/验收与进度.md`。
 
 ## Git
 

@@ -12,4 +12,4 @@
 | `punch/` | 探测、打洞客户端、局域网通告 | 刘 |
 | `ui/` | 界面与路径显示 | 刘 |
 
-可执行文件由根目录 `Makefile` 链接：`room_server`、`relay_server`、`client`、`client_transfer`。跨目录改动须对照 [`docs/模块对接.md`](../docs/模块对接.md)。
+可执行文件由根目录 `Makefile` 链接：`room_server`、`relay_server`、`client`、`client_transfer`。跨目录改动须对照 [`docs/模块说明.md`](../docs/模块说明.md)。

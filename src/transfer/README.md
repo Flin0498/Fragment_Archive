@@ -24,4 +24,4 @@
 
 运行 `make transfer`，使用 `./client_transfer`（原 `./client` 保留）。
 `CMD_JOIN_OK` 经 `members(..., join=1)` 更新 `ui_state`（含 `ui_set_status`「已进房」），与 `./client` 案情板一致。
-测试：`make test-transfer`。说明见 [`docs/传块模块.md`](../../docs/传块模块.md)、[`docs/界面与通告.md`](../../docs/界面与通告.md)。
+测试：`make test-transfer`。说明见 [`docs/模块说明.md`](../../docs/模块说明.md)、[`docs/模块说明.md`](../../docs/模块说明.md)。

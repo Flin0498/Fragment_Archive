@@ -26,7 +26,7 @@ make clean && make
 mkdir -p logs
 ```
 
-Windows 上使用 WSL2，见 [`docs/构建说明.md`](../docs/构建说明.md)。跑脚本前若端口占用，可先：
+Windows 上使用 WSL2，见 [`docs/构建与演示.md`](../docs/构建与演示.md)。跑脚本前若端口占用，可先：
 
 ```bash
 pkill -9 -f room_server 2>/dev/null
@@ -131,7 +131,7 @@ announce
 
 ## 关房 + 晚进通告（手工四窗，无自动化脚本）
 
-四窗手工步骤见 [`docs/构建说明.md`](../docs/构建说明.md)「关房实验」。D 窗保持未进房。
+四窗手工步骤见 [`docs/构建与演示.md`](../docs/构建与演示.md)「关房实验」。D 窗保持未进房。
 
 **D 验收要点（peer 0、未进房）**：`ANNOUNCE` → `通告发现：已连接 房主:<端口>` → 状态「正在索取清单」。  
 通常**无**「已从房主取得 MANIFEST」（房主无陈侧清单缓存时为预期）。
@@ -157,7 +157,7 @@ make transfer
 make test-transfer
 ```
 
-生成 `room_server`、`client_transfer`、正式 `relay_server`。说明见 [`docs/传块模块.md`](../docs/传块模块.md)。测试占用 37401、37402、37405，先结束旧 `room_server` / `client`。`make test-transfer` 使用 `relay_server`。
+生成 `room_server`、`client_transfer`、正式 `relay_server`。说明见 [`docs/模块说明.md`](../docs/模块说明.md)。测试占用 37401、37402、37405，先结束旧 `room_server` / `client`。`make test-transfer` 使用 `relay_server`。
 
 ## 王侧 / 全组（参考）
 
@@ -167,4 +167,4 @@ make room_server relay_server test_client
 ./test_client    # 按 tests/test_client.c 说明
 ```
 
-相关文档：[`docs/界面与通告.md`](../docs/界面与通告.md)、[`docs/实验记录.md`](../docs/实验记录.md)、[`docs/构建说明.md`](../docs/构建说明.md)。
+相关文档：[`docs/模块说明.md`](../docs/模块说明.md)、[`docs/实验记录.md`](../docs/实验记录.md)、[`docs/构建与演示.md`](../docs/构建与演示.md)。
