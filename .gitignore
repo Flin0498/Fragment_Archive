@@ -20,6 +20,10 @@ logs/
 session_*/
 *.bin
 
+# 根目录演示视频只留在本机，不入库
+/demo.mp4
+/*.mp4
+
 # 大体量实验材料
 captures/*.pcap
 captures/*.pcapng
