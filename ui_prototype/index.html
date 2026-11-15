@@ -56,6 +56,10 @@
                   <input id="host-nick" class="input" maxlength="16" placeholder="你的昵称">
                 </div>
                 <div class="field">
+                  <label>房间服务地址</label>
+                  <input id="host-room" class="input" maxlength="45" placeholder="留空 = 本机自动拉起；或填独立 Tracker IP，如 172.20.10.6">
+                </div>
+                <div class="field">
                   <label>案件来源</label>
                   <div class="seg" id="case-source">
                     <button class="seg-btn active" data-src="auto">现场生成新案</button>
@@ -163,6 +167,7 @@
           <span class="conn-item">局号 <b id="conn-session">—</b></span>
           <span class="conn-item">房间 <b id="conn-room">—</b></span>
           <span class="conn-item status" id="conn-status">—</span>
+          <button class="btn tiny" id="btn-netlog" title="在独立终端窗口查看带 IP/端口的详细连接过程">▣ 网络日志（终端）</button>
         </div>
         <ol class="stepbar" id="stepbar">
           <li class="step" data-p="1"><span class="step-dot"></span><span class="step-name">入房</span></li>
@@ -195,6 +200,20 @@
         </div>
         <footer class="actions" id="actions"></footer>
       </section>
+
+      <!-- ============ 网络日志终端（独立于案情案板，实时显示连接细节） ============ -->
+      <div class="netlog-mask" id="netlog-mask" hidden>
+        <div class="netlog-win" role="dialog" aria-label="网络连接终端">
+          <div class="netlog-bar">
+            <span class="netlog-dot r"></span><span class="netlog-dot y"></span><span class="netlog-dot g"></span>
+            <span class="netlog-title">Fragment Archive · 网络连接终端</span>
+            <span class="netlog-file" id="netlog-file"></span>
+            <button class="netlog-clear" id="btn-netlog-popout" title="在独立浏览器窗口打开">⧉ 独立窗口</button>
+            <button class="netlog-close" id="btn-netlog-close" title="关闭">✕</button>
+          </div>
+          <pre class="netlog-body" id="netlog-body"></pre>
+        </div>
+      </div>
 
       <!-- ============ 历史案卷 ============ -->
       <section class="view" id="view-history" hidden>
@@ -248,7 +267,7 @@
         <figcaption class="lb-caption">
           <div class="lb-title" id="lb-title">证物</div>
           <div class="lb-sub" id="lb-sub">图 · 章1</div>
-          <p class="lb-desc" id="lb-desc"></p>
+          <div class="lb-desc" id="lb-desc"></div>
         </figcaption>
       </figure>
     </div>

@@ -90,6 +90,156 @@ function syncMeta() {
   $('badge-phase').textContent = PHASE_LABEL[st?.phase ?? 0] || '—';
 }
 
+// ---------------- 案卷正文（file_3）卷宗排版 ----------------
+const DOSSIER_TAGS = {
+  '案情通报':       { icon: '📣', cls: 'notice' },
+  '现场描写':       { icon: '🔍', cls: 'scene' },
+  '死者背景':       { icon: '🕯️', cls: 'victim' },
+  '嫌疑人背景与动机': { icon: '🎭', cls: 'suspect' },
+  '完整时间线':     { icon: '⏱️', cls: 'timeline' },
+  '物证清单':       { icon: '🧰', cls: 'evidence' },
+  '口供':           { icon: '💬', cls: 'testimony' },
+  '章间问答题':     { icon: '❓', cls: 'quiz' },
+};
+
+function dzEl(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+// “1. 赵枢：……。2. 钱映：……” 这类编号长段 → 拆成多条
+function splitNumbered(text) {
+  const items = [];
+  const re = /\d+[.、]\s*/g;
+  const idxs = [];
+  let m;
+  while ((m = re.exec(text)) !== null) idxs.push({ i: m.index, end: re.lastIndex });
+  if (idxs.length <= 1) return null;
+  // 仅当编号大多出现在句首/句号之后才认定为列表，避免误拆普通数字
+  let valid = 0;
+  for (let k = 0; k < idxs.length; k++) {
+    const before = text.slice(0, idxs[k].i).trim();
+    if (k === 0 ? before === '' : /[。；;！!？?]$/.test(before)) valid++;
+  }
+  if (valid < idxs.length - 1) return null;
+  for (let k = 0; k < idxs.length; k++) {
+    const start = idxs[k].end;
+    const stop = k + 1 < idxs.length ? idxs[k + 1].i : text.length;
+    const seg = text.slice(start, stop).trim();
+    if (seg) items.push(seg);
+  }
+  return items.length ? items : null;
+}
+
+// 时间线：“19:00 ……；19:30 ……” → 竖向时间轴
+function renderTimeline(body) {
+  const parts = body
+    .split(/[；;]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((seg) => {
+      const tm = seg.match(/^(\d{1,2}[:：]\d{2})\s*(.*)$/);
+      return tm ? { t: tm[1].replace('：', ':'), d: tm[2] } : { t: '', d: seg };
+    });
+  if (parts.length < 2) return null;
+  const wrap = dzEl('ol', 'dz-timeline');
+  parts.forEach((p) => {
+    const li = dzEl('li', 'dz-tl-item');
+    li.appendChild(dzEl('span', 'dz-tl-dot'));
+    const card = dzEl('div', 'dz-tl-card');
+    if (p.t) card.appendChild(dzEl('span', 'dz-tl-time', p.t));
+    card.appendChild(dzEl('span', 'dz-tl-desc', p.d));
+    li.appendChild(card);
+    wrap.appendChild(li);
+  });
+  return wrap;
+}
+
+// 编号列表（嫌疑人 / 物证 / 口供）：拆成带序号徽标的小卡片
+function renderNumbered(body, kind) {
+  const items = splitNumbered(body);
+  if (!items) return null;
+  const wrap = dzEl('div', 'dz-list dz-list-' + kind);
+  items.forEach((seg, i) => {
+    const card = dzEl('div', 'dz-item');
+    card.appendChild(dzEl('span', 'dz-item-no', String(i + 1)));
+    // “姓名：内容” 给姓名加粗头
+    const hm = seg.match(/^([\u4e00-\u9fa5A-Za-z0-9·]{2,12})[：:]\s*([\s\S]*)$/);
+    if (hm) {
+      const head = dzEl('span', 'dz-item-name', hm[1]);
+      const txt = dzEl('p', 'dz-item-text', hm[2]);
+      card.appendChild(head);
+      card.appendChild(txt);
+    } else {
+      card.appendChild(dzEl('p', 'dz-item-text', seg));
+    }
+    wrap.appendChild(card);
+  });
+  return wrap;
+}
+
+function renderDossier(container, raw) {
+  container.innerHTML = '';
+  const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  let titleDone = false;
+
+  lines.forEach((line) => {
+    const tm = line.match(/^【([^】]+)】([\s\S]*)$/);
+    if (!tm) {
+      // 首行通常是“案件卷宗：xxx”，作为页眉标题
+      if (!titleDone) {
+        titleDone = true;
+        const head = dzEl('header', 'dz-head');
+        const t = line.replace(/^案件卷宗[：:]\s*/, '').trim();
+        head.appendChild(dzEl('div', 'dz-kicker', '案 卷 正 文'));
+        head.appendChild(dzEl('h2', 'dz-title', t || line));
+        const rule = dzEl('div', 'dz-rule');
+        rule.appendChild(dzEl('span')); rule.appendChild(dzEl('i', 'dz-rule-seal', '档')); rule.appendChild(dzEl('span'));
+        head.appendChild(rule);
+        container.appendChild(head);
+      } else {
+        container.appendChild(dzEl('p', 'dz-plain', line));
+      }
+      return;
+    }
+
+    const tag = tm[1].trim();
+    const body = tm[2].trim();
+    const meta = DOSSIER_TAGS[tag] || { icon: '📄', cls: 'plain' };
+
+    const block = dzEl('section', 'dz-block dz-' + meta.cls);
+    const bar = dzEl('div', 'dz-block-head');
+    bar.appendChild(dzEl('span', 'dz-icon', meta.icon));
+    bar.appendChild(dzEl('span', 'dz-tag', tag));
+    block.appendChild(bar);
+
+    // 章间问答题只显示问题，判据已在 split('[判据]') 时剔除
+    if (meta.cls === 'quiz') {
+      const q = body.split(/\[判据\]/)[0].trim();
+      block.appendChild(dzEl('p', 'dz-quiz-q', q));
+      block.appendChild(dzEl('div', 'dz-quiz-hint', '🔎 答案请在游戏章间问答环节提交'));
+      container.appendChild(block);
+      return;
+    }
+
+    let built = null;
+    if (meta.cls === 'timeline') built = renderTimeline(body);
+    else if (meta.cls === 'suspect' || meta.cls === 'evidence' || meta.cls === 'testimony') {
+      built = renderNumbered(body, meta.cls);
+    }
+    if (built) {
+      block.appendChild(built);
+    } else {
+      block.appendChild(dzEl('p', 'dz-paragraph', body));
+    }
+    container.appendChild(block);
+  });
+
+  container.appendChild(dzEl('footer', 'dz-foot', '— 卷宗页 · 碎片档案 · 机密 —'));
+}
+
 // ---------------- 灯箱 ----------------
 function openLightbox(file, sidHexOverride) {
   const { file_id, kind, img_path, desc } = file;
@@ -99,6 +249,7 @@ function openLightbox(file, sidHexOverride) {
   imgBox.className = 'lb-img';
   imgBox.innerHTML = '';
   descEl.textContent = '';
+  descEl.classList.remove('dossier');
   $('lb-title').textContent = FILE_NAMES[file_id] || ('证物 ' + file_id);
   $('lb-sub').textContent = `${kind === 1 ? '图' : '文'}证物 · 章${file.chapter ?? '?'}`;
 
@@ -130,9 +281,12 @@ function openLightbox(file, sidHexOverride) {
   } else {
     // 文本证物没有图：隐藏图像区，否则会残留一个 220px 高空相框块在正文上方
     imgBox.classList.add('text-only');
-    descEl.textContent = '读取中…';
+    descEl.classList.add('dossier');
+    descEl.innerHTML = '<div class="dz-loading">卷宗调取中…</div>';
     fetch(url).then((r) => r.text()).then((txt) => {
-      descEl.textContent = txt.split('[判据]')[0].trim() || desc || '(空)';
+      const body = txt.split('[判据]')[0].trim();
+      if (body) renderDossier(descEl, body);
+      else descEl.textContent = desc || '(空)';
     }).catch(() => { descEl.textContent = '读取失败（可能尚未下载）'; });
   }
   $('lightbox').hidden = false;
@@ -357,8 +511,9 @@ $('btn-host-join').addEventListener('click', async () => {
       if (!sid) { toast('请选择历史案卷', true); return; }
     }
     const mode = $('host-mode').value;
+    const room = ($('host-room').value || '').trim();
     toast('正在启动 C 核心并进房…');
-    await startBridge({ role: 'host', nick, session: sid, mode });
+    await startBridge({ role: 'host', nick, session: sid, mode, host: room || undefined });
   } catch (e) { toast(e.message, true); }
 });
 
@@ -380,6 +535,10 @@ $('btn-history').addEventListener('click', async () => {
 });
 $('btn-history-back').addEventListener('click', () => showView('lobby'));
 $('btn-settings').addEventListener('click', () => { renderSettings(); showView('settings'); });
+$('btn-netlog').addEventListener('click', () => NetLog.show());
+$('btn-netlog-close').addEventListener('click', () => NetLog.hide());
+$('btn-netlog-popout').addEventListener('click', () => NetLog.popout());
+$('netlog-mask').addEventListener('click', (e) => { if (e.target.id === 'netlog-mask') NetLog.hide(); });
 
 // ---------------- 命令桥（游戏内操作） ----------------
 async function sendCmd(cmd) {
@@ -392,7 +551,104 @@ async function sendCmd(cmd) {
   }
 }
 
+// ---------------- 网络日志终端（点击即在独立窗口打开，与案情板分离） ----------------
+const NetLog = {
+  after: 0,
+  timer: null,
+  popWin: null,
+  logFile: '',
+
+  show() {
+    if (!S.bridge) { toast('尚未进入对局', true); return; }
+    // 窗口已开着就置前，不重复弹
+    if (this.popWin && !this.popWin.closed) { try { this.popWin.focus(); } catch (e) {} return; }
+    this.openWindow();
+  },
+
+  openWindow() {
+    const w = window.open('', 'fa_netlog', 'width=900,height=640');
+    if (!w) {
+      // 被浏览器拦截：退回页内浮层兜底
+      toast('浏览器拦截了独立窗口，改用页内显示；可允许弹窗后重试', true);
+      this.showFallback();
+      return;
+    }
+    w.document.write(
+      '<!doctype html><html><head><meta charset="utf-8"><title>Fragment Archive · 网络连接终端</title></head>' +
+      '<body style="margin:0;background:#0c0f14;">' +
+      '<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:#161c27;border-bottom:1px solid #2c3648;">' +
+      '<span style="color:#9fb0c8;font:12px Consolas,monospace;">Fragment Archive · 网络连接终端（自动保存：<span id="pop-file">-</span>）</span>' +
+      '<button id="pop-clear" style="margin-left:auto;background:transparent;border:1px solid #39445c;color:#aebcd2;border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer;">清屏</button>' +
+      '</div>' +
+      '<pre id="pop-body" style="font:12.5px/1.6 Consolas,Menlo,monospace;color:#c8d4e8;margin:0;padding:14px;box-sizing:border-box;height:calc(100vh - 40px);overflow:auto;white-space:pre-wrap;word-break:break-all;"></pre>' +
+      '</body></html>'
+    );
+    w.document.close();
+    this.popWin = w;
+    this.after = 0;
+    const pre = w.document.getElementById('pop-body');
+    pre.textContent = '正在连接网络日志…\n';
+    w.document.getElementById('pop-clear').onclick = () => { pre.textContent = ''; this.after = 0; };
+    // 独立窗口被手动关闭时停止轮询
+    const closedTimer = setInterval(() => {
+      if (w.closed) { clearInterval(closedTimer); this.stop(); }
+    }, 1000);
+    this.poll();
+    if (!this.timer) this.timer = setInterval(() => this.poll(), 800);
+  },
+
+  // 弹窗被拦截时的页内浮层兜底
+  showFallback() {
+    $('netlog-mask').hidden = false;
+    this.after = 0;
+    $('netlog-body').textContent = '正在连接网络日志…\n';
+    this.poll();
+    if (!this.timer) this.timer = setInterval(() => this.poll(), 800);
+  },
+
+  hide() {
+    $('netlog-mask').hidden = true;
+    this.stop();
+  },
+
+  stop() {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.popWin && !this.popWin.closed) { try { this.popWin.close(); } catch (e) {} }
+    this.popWin = null;
+  },
+
+  append(lines) {
+    if (!lines || !lines.length) return;
+    const text = lines.join('\n') + '\n';
+    const put = (pre) => {
+      if (!pre) return;
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+      pre.textContent += text;
+      if (pre.textContent.length > 200000) pre.textContent = pre.textContent.slice(-180000);
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    };
+    if (this.popWin && !this.popWin.closed) {
+      put(this.popWin.document.getElementById('pop-body'));
+      const f = this.popWin.document.getElementById('pop-file');
+      if (f && this.logFile) f.textContent = this.logFile;
+    }
+    if (!$('netlog-mask').hidden) put($('netlog-body'));
+  },
+
+  async poll() {
+    if (!S.bridge) return;
+    try {
+      const j = await api(`/api/bridge/${S.bridge}/netlog?after=${this.after}`);
+      this.after = j.total;
+      this.logFile = j.log_file || '';
+      $('netlog-file').textContent = this.logFile ? ('自动保存：' + this.logFile) : '';
+      this.append(j.lines);
+    } catch (e) { /* 静默重试 */ }
+  },
+};
+
 async function leaveGame() {
+  NetLog.hide();
   if (S.bridge) {
     api(`/api/bridge/${S.bridge}/quit`, { method: 'POST' }).catch(() => {});
   }
@@ -447,7 +703,7 @@ function renderGame() {
 }
 
 function boardSignature(files) {
-  return files.map((f) => f.file_id + ':' + (f.have ? 1 : 0) + ':' + f.kind + ':' + f.size).join('|');
+  return files.map((f) => f.file_id + ':' + (f.have ? 1 : 0) + ':' + f.kind + ':' + f.size + ':' + (f.source_nick || '')).join('|');
 }
 function renderBoard(st, sidHex) {
   const board = $('board');
@@ -473,8 +729,11 @@ function renderBoard(st, sidHex) {
     const kindTxt = f.kind === 1 ? '图' : '文';
 
     const code = 'E-' + String(f.file_id + 1).padStart(2, '0');
+    const srcNick = (f.source_nick || '').trim();
+    const srcLabel = !have ? '' : (srcNick === 'local' || !srcNick ? '本地' : srcNick);
+    const srcLine = have ? `<div class="source-line">来源：${srcLabel}</div>` : '';
     const evMeta = have
-      ? '点击卡片在灯下检视这件证物'
+      ? ('点击卡片在灯下检视这件证物' + (srcLabel ? '；来源：' + srcLabel : ''))
       : '碎片在队友手中，点「下载证物」经 P2P 拉取';
 
     const card = document.createElement('div');
@@ -489,6 +748,7 @@ function renderBoard(st, sidHex) {
           <div class="icon">${icon}</div>
           <div class="name">${name}</div>
           <div class="kind">${kindTxt}证物 · ${fmtSize(f.size)}</div>
+          ${srcLine}
           <div class="hint-face">${have ? '点击查看' : '尚未获取'}</div>
         </div>
         <div class="back">
