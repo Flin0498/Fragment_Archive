@@ -104,6 +104,34 @@ void ui_set_file_meta(struct ui_state *s, uint8_t file_id, uint8_t chapter,
     /* 真实证物文件路径由 transfer 装载清单后经 ui_set_file_content 写入 */
     f->img_path[0] = '\0';
     f->desc[0] = '\0';
+    f->piece_total = 0;
+    f->piece_have = 0;
+    f->bytes_have = 0;
+    f->dl_source[0] = '\0';
+}
+
+/* 设置文件总分块数（装载清单后调用一次） */
+void ui_set_file_piece_total(struct ui_state *s, uint8_t file_id, uint16_t piece_total)
+{
+    if (file_id < 1 || file_id > UI_MAX_FILES) return;
+    struct ui_file *f = &s->files[file_id - 1];
+    if (!f->used) return;
+    f->piece_total = piece_total;
+}
+
+/* 收块进度回调：piece_have/bytes_have 为本机累计，source_nick 为最近一块来源
+  （"local" 表示本地命中）。线程安全由调用方在已持有 ui 锁时保证。 */
+void ui_set_file_progress(struct ui_state *s, uint8_t file_id,
+                          uint16_t piece_have, uint32_t bytes_have,
+                          const char *source_nick)
+{
+    if (file_id < 1 || file_id > UI_MAX_FILES) return;
+    struct ui_file *f = &s->files[file_id - 1];
+    if (!f->used) return;
+    f->piece_have = piece_have;
+    f->bytes_have = bytes_have;
+    if (source_nick && source_nick[0])
+        snprintf(f->dl_source, sizeof(f->dl_source), "%s", source_nick);
 }
 
 int ui_set_file_status(struct ui_state *s, uint8_t file_id, int have,
@@ -266,6 +294,9 @@ void ui_state_write_json(const struct ui_state *s, const char *path)
         json_str(fp, f->hash_hex);
         fprintf(fp, ",\"have\":%d,\"source_nick\":", f->have);
         json_str(fp, f->source_nick);
+        fprintf(fp, ",\"piece_total\":%u,\"piece_have\":%u,\"bytes_have\":%u,\"dl_source\":",
+                f->piece_total, f->piece_have, f->bytes_have);
+        json_str(fp, f->dl_source);
         fprintf(fp, ",\"img_path\":");
         json_str(fp, f->img_path);
         fprintf(fp, ",\"desc\":");

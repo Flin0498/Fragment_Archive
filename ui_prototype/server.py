@@ -353,6 +353,9 @@ class Bridge:
         self._peer_route = {}   # peer_id -> "TCP" / "UDP" / "RELAY"（据连接事件推断当前数据路径）
         self._pending = {}      # peer_id -> {"piece":k, "t":开始时间, "warned":bool}
         self._missing_seen = set()  # 已提示过“待下载”的文件号
+        # 每文件下载进度跟踪：fid -> {phase, total, have, pct, last_log}
+        # phase: waiting(待下载) / downloading(接收中) / done(成功) / fail(校验失败)
+        self._dl = {}
         self._stop_mon = threading.Event()
         self._mu = threading.Lock()
         self.started = False
@@ -468,12 +471,93 @@ class Bridge:
         elif w in ("PIECE_OK", "SOURCE_LOST", "REQUEST_TIMEOUT"):
             self._pending.pop(peer, None)
 
+    @staticmethod
+    def _fmt_bytes(n):
+        n = float(n or 0)
+        for unit in ("字节", "KB", "MB"):
+            if n < 1024 or unit == "MB":
+                return ("%.0f%s" if unit == "字节" else "%.1f%s") % (n, unit)
+            n /= 1024
+
+    def _src_label(self, src):
+        src = (src or "").strip()
+        if src in ("", "local"):
+            return "本地缓存"
+        return "来自 " + src
+
+    def _track_download(self, f):
+        """按 C 端累计进度为单个证物输出阶段性下载日志。
+        状态机：waiting（待下载）→ downloading（接收中，按进度/时间节流）
+        → done（成功）；FILE_HASH_FAIL 事件把状态置 fail（失败）。"""
+        fid = f.get("file_id")
+        have = bool(f.get("have"))
+        total = int(f.get("piece_total") or 0)
+        got = int(f.get("piece_have") or 0)
+        bytes_have = int(f.get("bytes_have") or 0)
+        size = int(f.get("size") or 0)
+        name = self._fname(f)
+        kind_txt = "图像" if f.get("kind") == 1 else "文档"
+        st_rec = self._dl.get(fid)
+
+        # 失败优先（由事件处理置位）
+        if st_rec and st_rec.get("phase") == "fail":
+            return
+
+        # 成功：整文件校验通过
+        if have:
+            if not st_rec or st_rec.get("phase") != "done":
+                src = self._src_label(f.get("source_nick"))
+                self._net("✓ 接收成功：证物文件%s《%s》（%s，%s）全部 %s 块校验通过，%s",
+                          fid, name, kind_txt, self._fmt_bytes(size),
+                          total or "?", src)
+                self._dl[fid] = {"phase": "done", "total": total, "have": got,
+                                 "pct": 100, "last_log": time.time()}
+            return
+
+        # 尚未拿到清单分块信息：仅在第一次提示“待下载”
+        if not total:
+            if fid not in self._missing_seen:
+                self._missing_seen.add(fid)
+                self._net("待接收：证物文件%s《%s》（%s，%s）——尚未持有，等待在线成员提供",
+                          fid, name, kind_txt, self._fmt_bytes(size))
+                self._dl[fid] = {"phase": "waiting", "total": 0, "have": 0,
+                                 "pct": -1, "last_log": time.time()}
+            return
+
+        pct = int(got * 100 / total) if total else 0
+        now = time.time()
+
+        # 0 块：仍在等待来源（不重复刷屏，WAITING 事件另有说明）
+        if got == 0:
+            if not st_rec or st_rec.get("phase") != "waiting":
+                self._net("待接收：证物文件%s《%s》（%s，%s，共 %d 块）——等待在线成员提供",
+                          fid, name, kind_txt, self._fmt_bytes(size), total)
+                self._dl[fid] = {"phase": "waiting", "total": total, "have": 0,
+                                 "pct": 0, "last_log": now}
+            return
+
+        src = self._src_label(f.get("dl_source"))
+        rec = st_rec or {}
+        last_pct = rec.get("pct", -1)
+        last_t = rec.get("last_log", 0)
+        entering = rec.get("phase") != "downloading"
+
+        # 进入接收中，或跨过 25% 台阶，或距上次进度行≥1.5s，才输出一行，避免逐块刷屏
+        milestone = (pct >= 100) or (pct // 25 > (max(last_pct, 0)) // 25)
+        if entering or milestone or (now - last_t >= 1.5):
+            prefix = "② 开始接收" if entering else "下载进展"
+            self._net("%s：证物文件%s《%s》 %d/%d 块（%d%%，%s/%s），%s",
+                      prefix, fid, name, got, total, pct,
+                      self._fmt_bytes(bytes_have), self._fmt_bytes(size), src)
+        self._dl[fid] = {"phase": "downloading", "total": total, "have": got,
+                         "pct": pct, "last_log": now if (entering or milestone or
+                                                         now - last_t >= 1.5) else last_t}
+
     def _monitor_state(self):
         """轮询 ui_state JSON，把连接/路径/证物变化翻译成带端点的详细日志。
         数据全部来自 C 核心已写出的状态，无需改动或重编译 C。"""
         last_online = None
         known_peers = {}
-        last_files = {}
         while not self._stop_mon.wait(0.6):
             st = self.state()
             if not st:
@@ -504,26 +588,10 @@ class Bridge:
                 if not any(p.get("peer_id") == pid for p in st.get("peers", [])):
                     self._net("成员 peer%s 已离开房间", pid)
                     known_peers.pop(pid, None)
-            # 3) 证物状态：清单里缺失的文件先提示“待下载”，集齐后提示完成+来源
+            # 3) 下载进度（基于 C 端累计的 piece_have/piece_total，可轮询、不丢）：
+            #    待下载 → 接收中(节流阶段行 + 百分比/块数/字节/来源) → 成功 / 校验失败
             for f in st.get("files", []):
-                fid = f.get("file_id")
-                have = bool(f.get("have"))
-                src = (f.get("source_nick") or "").strip()
-                kind_txt = "图像" if f.get("kind") == 1 else "文档"
-                name = self._fname(f)
-                if not have:
-                    if fid not in self._missing_seen:
-                        self._missing_seen.add(fid)
-                        self._net("待接收：证物文件%s《%s》（%s，%s 字节）——尚未持有，等待在线成员提供",
-                                  fid, name, kind_txt, f.get("size"))
-                    last_files[fid] = (False, src)
-                else:
-                    sig = (True, src)
-                    if last_files.get(fid) != sig:
-                        src_txt = "本地自带" if src in ("", "local") else ("来自 " + src)
-                        self._net("接收成功：证物文件%s《%s》（%s，%s 字节）全部块校验通过，%s",
-                                  fid, name, kind_txt, f.get("size"), src_txt)
-                    last_files[fid] = sig
+                self._track_download(f)
             # 4) 新事件：中文说明在前，真实英文事件在下一行（不带时间戳）；同时维护路径/在途状态
             peers = {p.get("peer_id"): p for p in st.get("peers", [])}
             for raw in st.get("events", []):
@@ -535,6 +603,16 @@ class Bridge:
                 self._net(self._explain_event(raw, peers))
                 self._net(eng, ts=False)
                 self._track_event(raw)
+                # 整文件校验失败：标记该文件为 fail，输出明确失败状态并保留进度行不再推进
+                if word == "FILE_HASH_FAIL":
+                    toks = raw.split()
+                    fid = int(toks[1]) if len(toks) > 1 and toks[1].isdigit() else None
+                    if fid is not None:
+                        self._dl[fid] = {"phase": "fail", "total": None, "have": None,
+                                         "pct": 100, "last_log": time.time()}
+                        fmeta = next((x for x in st.get("files", []) if x.get("file_id") == fid), {})
+                        self._net("✗ 接收失败：证物文件%s《%s》块虽集齐，但整文件 SHA256 校验不符，未标记完成，将重试",
+                                  fid, self._fname(fmeta))
             # 5) 卡顿监控：某块“已请求”超过阈值仍无回应，主动指出卡在哪一对端/哪个块
             now = time.time()
             for pid, info in list(self._pending.items()):

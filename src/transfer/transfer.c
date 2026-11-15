@@ -65,6 +65,18 @@ static void event(struct transfer *t,const char *s,int a,int b) {
     printf("TRANSFER %s %d %d\n",s,a,b); fflush(stdout);
     ui_state_lock(t->ui); ui_push_event(t->ui,"%s %d %d",s,a,b); ui_state_unlock(t->ui);
 }
+/* 统计某文件本机已收齐的块数与字节数（按分块位图 have[f]） */
+static void have_count(struct transfer *t,int f,uint16_t *pieces,uint32_t *bytes) {
+    unsigned cnt=t->manifest.files[f].piece_count;uint16_t pc=0;uint32_t by=0;
+    for(unsigned k=0;k<cnt;k++)if(t->have[f]&(1u<<k)){pc++;by+=(uint32_t)piece_len(t,f,(int)k);}
+    if(pieces)*pieces=pc;
+    if(bytes)*bytes=by;
+}
+/* 把某文件当前累计收块进度同步到 ui_state（调用方须已持有 ui 锁或自行加锁） */
+static void sync_progress(struct transfer *t,int f,const char *src) {
+    uint16_t pc;uint32_t by;have_count(t,f,&pc,&by);
+    ui_set_file_progress(t->ui,(uint8_t)(f+1),pc,by,src);
+}
 static struct connection *link_for(struct transfer *t,int id) {
     for(int i=0;i<CONNS;i++) if(t->conn[i].fd>=0 && !t->conn[i].relay && t->conn[i].id==id) return &t->conn[i];
     return NULL;
@@ -163,6 +175,7 @@ static int store_piece(struct transfer *t,int id,int f,int k,const unsigned char
     if(fclose(fp)!=0)ok=0;
     if(!ok)return -1;
     memcpy(t->data[f]+(size_t)k*GEN_PIECE,bytes,n);t->have[f]|=1u<<k;t->last_source[f]=id;t->down[id]+=n;
+    ui_state_lock(t->ui);sync_progress(t,f,t->peers[id].info.nick[0]?t->peers[id].info.nick:"peer");ui_state_unlock(t->ui);
     event(t,"PIECE_OK",id,k);changed(t,f,k);finish_file(t,f);return 0;
 }
 static int valid_manifest(const unsigned char *b,size_t n) {
@@ -193,6 +206,7 @@ int tr_manifest(struct transfer *t,const unsigned char *b,size_t n) {
         struct gen_file *g=&t->manifest.files[f];t->data[f]=calloc(1,g->file_size);if(!t->data[f])return -1;
         ui_state_lock(t->ui);ui_apply_manifest_header(t->ui,t->manifest.session_id,NULL);
         ui_set_file_meta(t->ui,g->file_id,g->chapter,g->kind,g->file_size,g->file_hash);
+        ui_set_file_piece_total(t->ui,g->file_id,(uint16_t)g->piece_count);
         /* 证物真实文件路径（相对项目根，供 Web 拉取）；文案由文证物文件内容提供 */
         char web_path[UI_IMG_PATH_MAX];
         snprintf(web_path,sizeof(web_path),"session_%08x/file_%u",t->manifest.session_id,g->file_id);
@@ -204,6 +218,7 @@ int tr_manifest(struct transfer *t,const unsigned char *b,size_t n) {
                 memcpy(t->data[f]+k*GEN_PIECE,piece,got);t->have[f]|=1u<<k;event(t,"RESUME_BLOCK",f+1,(int)k);
             }
         }
+        if(t->have[f]){ui_state_lock(t->ui);sync_progress(t,f,"local");ui_state_unlock(t->ui);}
         finish_file(t,f);
     }
     event(t,"MANIFEST_READY",(int)n,0);return 0;

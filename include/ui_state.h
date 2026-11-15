@@ -46,6 +46,11 @@ struct ui_file {
     char     source_nick[UI_NICK_MAX + 1];
     char     img_path[UI_IMG_PATH_MAX]; /* 证物图片路径，供 Web 放大展示 */
     char     desc[UI_DESC_MAX];         /* 证物文案 */
+    /* 下载进度（可轮询的累计量，不依赖会溢出的事件环），供网络日志做阶段性进度行 */
+    uint16_t piece_total;           /* 该文件总分块数 */
+    uint16_t piece_have;            /* 本机已收齐的分块数 */
+    uint32_t bytes_have;            /* 已收字节数（含本地命中） */
+    char     dl_source[UI_NICK_MAX + 1]; /* 最近一块的来源昵称（local=本地命中） */
 };
 
 struct ui_state {
@@ -84,6 +89,11 @@ void ui_apply_manifest_header(struct ui_state *s, uint32_t session_id,
 void ui_set_file_meta(struct ui_state *s, uint8_t file_id, uint8_t chapter,
                       uint8_t kind, uint32_t file_size,
                       const uint8_t file_hash[32]);
+void ui_set_file_piece_total(struct ui_state *s, uint8_t file_id, uint16_t piece_total);
+/* 传块回调：更新本机累计收块进度与最近来源（在已持有 ui 锁时调用） */
+void ui_set_file_progress(struct ui_state *s, uint8_t file_id,
+                          uint16_t piece_have, uint32_t bytes_have,
+                          const char *source_nick);
 /* 传块回调：更新证物已有与来源 */
 int ui_set_file_status(struct ui_state *s, uint8_t file_id, int have,
                        const char *source_nick);
