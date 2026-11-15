@@ -23,6 +23,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -300,6 +301,16 @@ def _is_runnable(p):
     return True
 
 
+# transfer.c 经 event() 打到 stdout 的事件词（原样 "TRANSFER <WORD> a b"），
+# 网络日志据此把 ui_state 里的事件还原成真实英文命令行。
+TRANSFER_WORDS = {
+    "UDP_READY", "TCP_CONNECTED", "RELAY_CONNECTED", "UDP_FALLBACK", "UDP_RETRY",
+    "REQUEST", "PIECE_OK", "HASH_REJECT", "FILE_COMPLETE", "FILE_HASH_FAIL",
+    "MANIFEST_READY", "RESUME_BLOCK", "DOWNLOAD_ON", "DOWNLOAD_PAUSED",
+    "SOURCE_LOST", "REQUEST_TIMEOUT", "ANNOUNCE_TCP", "WAITING_FOR_AVAILABLE_SOURCE",
+}
+
+
 def ensure_services():
     """确保 room_server / relay_server 在跑（未监听且二进制存在则拉起）。"""
     started = []
@@ -335,6 +346,14 @@ class Bridge:
         self.proc = None
         self.state_path = os.path.join(ROOT, "logs", "ui_state_%s.json" % self.id)
         self.log_lines = []
+        # 详细网络日志：独立于命令行可视化案板，记录带 IP/端口的连接过程，并自动落盘
+        self.netlog_path = os.path.join(ROOT, "logs", "netlog_%s.log" % self.id)
+        self.net_lines = []
+        self._seen_events = set()
+        self._peer_route = {}   # peer_id -> "TCP" / "UDP" / "RELAY"（据连接事件推断当前数据路径）
+        self._pending = {}      # peer_id -> {"piece":k, "t":开始时间, "warned":bool}
+        self._missing_seen = set()  # 已提示过“待下载”的文件号
+        self._stop_mon = threading.Event()
         self._mu = threading.Lock()
         self.started = False
 
@@ -357,13 +376,253 @@ class Bridge:
         )
         self.started = True
         threading.Thread(target=self._pump_stdout, daemon=True).start()
-        # 进房意图明确，直接翻译成 join 命令
+        threading.Thread(target=self._monitor_state, daemon=True).start()
+        # 1) 中文说明 + 下一行原样打印真正执行的命令行（绝对路径保持原样，与实际 spawn 完全一致）
+        try:
+            import shlex
+            cmdline = shlex.join(argv)
+        except Exception:
+            cmdline = " ".join(argv)
+        self._net("启动游戏核心 client_transfer：角色=%s；Tracker 稍后用 join 命令指定（%s:%s）；模式=%s",
+                  "房主" if self.role == "host" else "侦探",
+                  self.host, 37401,
+                  self.mode or "自动（局域网TCP→UDP打洞→中继）")
+        self._net("$ %s", cmdline, ts=False)
+        self._net("工作目录 cwd=%s", ROOT, ts=False)
+        self._net("环境变量 UI_JSON_PATH=%s（状态落盘文件，前端据此渲染）", self.state_path, ts=False)
+        # 2) 进房命令（中文说明 + 真实英文 stdin 命令由 command() 统一记录）
         join_cmd = "join %s %s%s" % (self.nick, self.host,
                                      " host" if self.role == "host" else "")
         self.command(join_cmd)
         return self.id
 
+    # --- 详细网络日志：时间戳 + 中文步骤 + IP/端口，独立文件落盘 ---
+    def _net(self, msg, *args, **kw):
+        try:
+            text = msg % args if args else str(msg)
+        except Exception:
+            text = str(msg)
+        if kw.get("ts") is False:
+            # 续行（如真实命令/英文事件）：对齐到时间戳之后，不再重复打时间
+            line = "        %s" % text
+        else:
+            line = "[%s] %s" % (time.strftime("%H:%M:%S"), text)
+        with self._mu:
+            self.net_lines.append(line)
+            if len(self.net_lines) > 2000:
+                self.net_lines = self.net_lines[-2000:]
+        try:
+            os.makedirs(os.path.dirname(self.netlog_path), exist_ok=True)
+            with open(self.netlog_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _peer_addr(p):
+        """把一个 peer 的私网/反射/TCP/UDP 端点拼成可读串。"""
+        parts = []
+        priv = p.get("priv_ip")
+        if priv and priv != "-":
+            parts.append("私网 %s:%s(TCP)/%s(UDP)" % (
+                priv, p.get("tcp_port"), p.get("udp_port")))
+        refl = p.get("refl_ip")
+        if refl and refl != "-" and p.get("refl_port"):
+            parts.append("反射 %s:%s" % (refl, p.get("refl_port")))
+        return "；".join(parts) if parts else "地址尚未探测（反射 -:0）"
+
+    @staticmethod
+    def _fname(f):
+        """从 img_path 取可读文件名，失败退回编号。"""
+        p = (f.get("img_path") or "").replace("\\", "/")
+        base = p.rsplit("/", 1)[-1]
+        return base or ("文件%s" % f.get("file_id"))
+
+    def _track_event(self, raw):
+        """据连接/传输事件维护对端当前数据路径和“在途请求”，供细分日志与卡顿监控。
+        注意：C 的 TCP_CONNECTED 事件两个参数是 (本机id, 对端id)，其余多为 (对端id, 块)。"""
+        toks = raw.split()
+        w = toks[0] if toks else ""
+        nums = [int(x) for x in toks[1:] if x.lstrip("-").isdigit()]
+        peer, piece, route = None, None, None
+        if w == "TCP_CONNECTED":
+            peer, route = (nums[1] if len(nums) >= 2 else None), "TCP直连"
+        elif w == "UDP_READY":
+            peer, route = (nums[0] if nums else None), "UDP打洞"
+        elif w == "UDP_FALLBACK":
+            peer, route = (nums[0] if nums else None), "中继"
+        elif w == "RELAY_CONNECTED":
+            peer, route = (nums[0] if nums else None), "中继"
+        elif w == "REQUEST":
+            peer = nums[0] if nums else None
+            piece = nums[1] if len(nums) > 1 else None
+        elif w in ("PIECE_OK", "HASH_REJECT", "SOURCE_LOST", "REQUEST_TIMEOUT"):
+            peer = nums[0] if nums else None
+            piece = nums[1] if len(nums) > 1 else None
+        else:
+            return
+        if peer is not None and route is not None:
+            self._peer_route[peer] = route
+        if w == "REQUEST":
+            self._pending[peer] = {"piece": piece, "t": time.time(), "warned": False, "done": False}
+        elif w in ("PIECE_OK", "SOURCE_LOST", "REQUEST_TIMEOUT"):
+            self._pending.pop(peer, None)
+
+    def _monitor_state(self):
+        """轮询 ui_state JSON，把连接/路径/证物变化翻译成带端点的详细日志。
+        数据全部来自 C 核心已写出的状态，无需改动或重编译 C。"""
+        last_online = None
+        known_peers = {}
+        last_files = {}
+        while not self._stop_mon.wait(0.6):
+            st = self.state()
+            if not st:
+                continue
+            # 1) Tracker 在线状态翻转
+            online = bool(st.get("room_online"))
+            if online != last_online:
+                if last_online is not None:
+                    if online:
+                        self._net("✓ 已连接 Tracker %s:%s，进房成功（peer=%s，房间=%s，局号=%s）",
+                                  self.host, 37401, st.get("my_peer_id"),
+                                  st.get("room_id"), st.get("session_id"))
+                    else:
+                        self._net("✗ 与 Tracker %s:%s 的连接断开（已知玩家之间仍可继续传块）",
+                                  self.host, 37401)
+                last_online = online
+            # 2) 成员增删（带完整端点）
+            for p in st.get("peers", []):
+                pid = p.get("peer_id")
+                sig = (p.get("nick"), p.get("priv_ip"), p.get("tcp_port"),
+                       p.get("udp_port"), p.get("refl_ip"), p.get("refl_port"))
+                if known_peers.get(pid) != sig:
+                    tag = "（我）" if pid == st.get("my_peer_id") else ""
+                    self._net("成员 peer%s %s%s：%s",
+                              pid, p.get("nick") or "", tag, self._peer_addr(p))
+                    known_peers[pid] = sig
+            for pid in list(known_peers.keys()):
+                if not any(p.get("peer_id") == pid for p in st.get("peers", [])):
+                    self._net("成员 peer%s 已离开房间", pid)
+                    known_peers.pop(pid, None)
+            # 3) 证物状态：清单里缺失的文件先提示“待下载”，集齐后提示完成+来源
+            for f in st.get("files", []):
+                fid = f.get("file_id")
+                have = bool(f.get("have"))
+                src = (f.get("source_nick") or "").strip()
+                kind_txt = "图像" if f.get("kind") == 1 else "文档"
+                name = self._fname(f)
+                if not have:
+                    if fid not in self._missing_seen:
+                        self._missing_seen.add(fid)
+                        self._net("待接收：证物文件%s《%s》（%s，%s 字节）——尚未持有，等待在线成员提供",
+                                  fid, name, kind_txt, f.get("size"))
+                    last_files[fid] = (False, src)
+                else:
+                    sig = (True, src)
+                    if last_files.get(fid) != sig:
+                        src_txt = "本地自带" if src in ("", "local") else ("来自 " + src)
+                        self._net("接收成功：证物文件%s《%s》（%s，%s 字节）全部块校验通过，%s",
+                                  fid, name, kind_txt, f.get("size"), src_txt)
+                    last_files[fid] = sig
+            # 4) 新事件：中文说明在前，真实英文事件在下一行（不带时间戳）；同时维护路径/在途状态
+            peers = {p.get("peer_id"): p for p in st.get("peers", [])}
+            for raw in st.get("events", []):
+                if raw in self._seen_events:
+                    continue
+                self._seen_events.add(raw)
+                word = raw.split(" ", 1)[0]
+                eng = ("TRANSFER " + raw) if word in self.TRANSFER_WORDS else raw
+                self._net(self._explain_event(raw, peers))
+                self._net(eng, ts=False)
+                self._track_event(raw)
+            # 5) 卡顿监控：某块“已请求”超过阈值仍无回应，主动指出卡在哪一对端/哪个块
+            now = time.time()
+            for pid, info in list(self._pending.items()):
+                if info.get("warned") or info.get("done"):
+                    continue
+                wait = now - info["t"]
+                p = peers.get(pid)
+                pname = (p.get("nick") if p else None) or ("peer%s" % pid)
+                route = self._peer_route.get(pid, "未知路径")
+                if wait >= 3.0:
+                    self._net("⚠ 已等待 %.1f 秒：向 %s（%s）请求的块%s 仍未收到，可能对端无此块/路径不通，稍后将重试或换源",
+                              wait, pname, route, info["piece"])
+                    info["warned"] = True
+
+    def _explain_event(self, raw, peers):
+        word, _, rest = raw.partition(" ")
+        nums = rest.split()
+        a = int(nums[0]) if nums and nums[0].lstrip("-").isdigit() else 0
+        b = int(nums[1]) if len(nums) > 1 and nums[1].lstrip("-").isdigit() else 0
+        # C 的 TCP_CONNECTED 参数是 (本机id, 对端id)，对端取 b；其余事件对端取 a
+        peer_id = b if word == "TCP_CONNECTED" else a
+        p = peers.get(peer_id)
+
+        def nick(pid=None):
+            pp = p if pid is None else peers.get(pid)
+            return (pp.get("nick") if pp else None) or ("peer%s" % (peer_id if pid is None else pid))
+
+        def refl_ep():
+            if p and p.get("refl_ip") and p.get("refl_ip") != "-" and p.get("refl_port"):
+                return "%s:%s" % (p.get("refl_ip"), p.get("refl_port"))
+            return ""
+
+        def priv_ep():
+            if p and p.get("priv_ip") and p.get("priv_ip") != "-":
+                return "%s:%s(UDP)/%s(TCP)" % (p.get("priv_ip"), p.get("udp_port"), p.get("tcp_port"))
+            return ""
+
+        def ep_full():
+            r, q = refl_ep(), priv_ep()
+            if r and q:
+                return "%s，反射 %s" % (q, r)
+            return r or q or "地址尚未探测"
+
+        def src():   # 接收方向：数据来源端点
+            return "来源 %s（%s）" % (nick(), ep_full())
+
+        def dst():   # 发送方向：目标端点
+            return "目标 %s（%s）" % (nick(), ep_full())
+
+        def route():
+            return self._peer_route.get(peer_id, "自动路径")
+
+        table = {
+            # ---- 建链阶段：发起 → 建立/失败 → 兜底 ----
+            "UDP_READY": lambda: "① 通道就绪：与 %s 的 UDP 打洞成功，P2P 直连可用（反射 %s），此后数据不经 Tracker"
+                                 % (nick(), refl_ep() or priv_ep() or "未知"),
+            "TCP_CONNECTED": lambda: "① 通道就绪：与 %s 的 TCP 直连已建立（%s）" % (nick(), ep_full()),
+            "RELAY_CONNECTED": lambda: "① 通道就绪：已连上中继服务器 %s:37405（CMD_RELAY_BIND 已发，打洞失败时经此 C/S 中转）"
+                                       % self.host,
+            "UDP_RETRY": lambda: "… 正在向 %s 重发 UDP 打洞探测（第 %d 次，最多 5 次）" % (nick(), b),
+            "UDP_FALLBACK": lambda: "② 打洞失败：与 %s 的 UDP 打洞重试 %d 次仍不通，切换到中继兜底（%s:37405）"
+                                    % (nick(), b, self.host),
+            # ---- 收文件阶段：请求(开始接收) → 逐块成功/失败 → 整文件完成 ----
+            "REQUEST": lambda: "② 开始接收：向 %s 请求块%s（路径=%s）" % (dst(), b, route()),
+            "PIECE_OK": lambda: "③ 接收成功：收到 %s 的块%s（路径=%s），SHA256 校验通过并已写盘" % (src(), b, route()),
+            "HASH_REJECT": lambda: "✗ 块校验失败：来自 %s 的块%s 长度或 SHA256 不符，已丢弃并会重新请求" % (src(), b),
+            "FILE_COMPLETE": lambda: "④ 文件完成：文件%s 所有块集齐且整文件 SHA256 校验通过，上传来源=%s"
+                                     % (a, nick(b) if b else "本地"),
+            "FILE_HASH_FAIL": lambda: "✗ 文件%s 块虽集齐，但整文件 SHA256 校验失败，未标记为完成" % a,
+            "MANIFEST_READY": lambda: "清单就绪：已解析清单（%s 字节，3 个文件），即将核对本地缺块" % a,
+            "RESUME_BLOCK": lambda: "↺ 本地命中：文件%s 块%s 已在本地缓存且校验通过，无需网络下载" % (a, b),
+            "DOWNLOAD_ON": lambda: "▶ 下载开关打开：开始调度缺失块的请求",
+            "DOWNLOAD_PAUSED": lambda: "⏸ 下载开关关闭：暂停请求新块（已在途的不受影响）",
+            "SOURCE_LOST": lambda: "✗ 来源掉线：%s 在传输块%s 时连接断开，2 秒后重试或更换来源" % (src(), b),
+            "REQUEST_TIMEOUT": lambda: "✗ 请求超时：%s 的块%s 等待回应超时（路径=%s），放弃该来源并重试" % (dst(), b, route()),
+            "ANNOUNCE_TCP": lambda: "↔ 通告发现：经 Tracker %s:37401 拿到房主通告，正在向房主索取清单" % self.host,
+            "WAITING_FOR_AVAILABLE_SOURCE": lambda: "… 等待来源：当前没有任何在线成员持有缺块，挂起下载直到有人上线",
+        }
+        fn = table.get(word)
+        if fn:
+            try:
+                return fn()
+            except Exception:
+                return raw
+        return raw
+
     def _pump_stdout(self):
+        hb_logged = 0
         for line in self.proc.stdout:
             line = line.rstrip("\n")
             if not line:
@@ -371,9 +630,71 @@ class Bridge:
             with self._mu:
                 self.log_lines.append(line)
                 self.log_lines = self.log_lines[-200:]
+            # TRANSFER 事件已由状态监控处理，跳过避免重复；TRANSFER_STATS 单独解析
+            if line.startswith("TRANSFER "):
+                continue
+            if line == "ROOM_HEARTBEAT":
+                hb_logged += 1
+                if hb_logged == 1:
+                    self._net("保活：已向 Tracker 发送 ROOM_HEARTBEAT（每 5 秒一次，后续省略，不影响数据）")
+                    self._net("ROOM_HEARTBEAT", ts=False)
+                continue
+            if line.startswith("TRANSFER_STATS"):
+                self._net("传输统计：%s", self._explain_stats(line))
+                self._net(line, ts=False)
+                continue
+            if line.split(" ", 1)[0] in ("TRACKER_OFFLINE", "ROOM_ERROR"):
+                if line.startswith("TRACKER_OFFLINE"):
+                    self._net("✗ Tracker 不可达（控制连接异常，已建立的 P2P 传块不受影响）")
+                elif line.startswith("ROOM_ERROR"):
+                    self._net("✗ Tracker 返回错误：%s" % line[len("ROOM_ERROR"):].strip())
+                self._net(line, ts=False)
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
+
+    @staticmethod
+    def _explain_stats(line):
+        """把 TRANSFER_STATS 行里的 key=value 翻成中文摘要。"""
+        kv = {}
+        for tok in line.split()[1:]:
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                kv[k] = v
+        downs = ", ".join("%s=%s" % (k, kv[k]) for k in kv if k.startswith("from_"))
+        return ("本机 peer=%s；上行 TCP=%s / UDP=%s / 中继=%s 字节，合计 %s；"
+                "下载耗时 %s 秒；坏块拒绝 %s 次；各来源下行 %s" % (
+                    kv.get("peer", "-"), kv.get("tcp_up", 0), kv.get("udp_up", 0),
+                    kv.get("relay_up", 0), kv.get("total_up", 0),
+                    kv.get("elapsed", "-"), kv.get("hash_reject", 0),
+                    downs or "无"))
+
+    def _explain_stdin(self, cmd):
+        """把一条 stdin 命令翻译成中文说明（命令本身另起一行打印）。"""
+        parts = cmd.split()
+        w = parts[0] if parts else ""
+        rest = parts[1:]
+        table = {
+            "join":   lambda: ("以房主身份建房并进房，Tracker=%s" if len(rest) >= 3 and rest[2] == "host"
+                               else "以玩家身份进房，Tracker=%s") % (rest[1] if len(rest) >= 2 else "?"),
+            "probe":  lambda: "向 Tracker 发送 PROBE，查询本机反射地址",
+            "announce": lambda: "向 Tracker 通告本机持有的块清单",
+            "next":   lambda: "推进剧情到下一节点",
+            "answer": lambda: "提交剧情问答题答案：%s" % (" ".join(rest) if rest else ""),
+            "choose": lambda: "在分支项中选择：%s" % (" ".join(rest) if rest else ""),
+            "get":    lambda: "开始下载所有缺失的块",
+            "pause":  lambda: "暂停下载",
+            "stats":  lambda: "查看传输统计",
+            "redraw": lambda: "手动重绘命令行案板",
+            "quit":   lambda: "退出对局",
+        }
+        fn = table.get(w)
+        if fn:
+            try:
+                return fn()
+            except Exception:
+                pass
+        return "执行命令"
 
     def command(self, cmd):
         cmd = (cmd or "").strip()
@@ -381,6 +702,9 @@ class Bridge:
             return False, "空命令"
         if not self.running():
             return False, "client_transfer 已退出"
+        # 先写中文说明，再另起一行（不带时间戳）原样记录下发给 client_transfer 的英文 stdin 命令
+        self._net("%s", self._explain_stdin(cmd))
+        self._net(">>> %s", cmd, ts=False)
         try:
             self.proc.stdin.write(cmd + "\n")
             self.proc.stdin.flush()
@@ -401,7 +725,14 @@ class Bridge:
         with self._mu:
             return list(self.log_lines[-100:])
 
+    def netlog(self, after=0):
+        """返回 (全部详细日志行, 最新行号)；after 用于前端增量拉取。"""
+        with self._mu:
+            lines = list(self.net_lines)
+        return lines[after:], len(lines)
+
     def quit(self):
+        self._stop_mon.set()
         if self.running():
             try:
                 self.proc.stdin.write("quit\n")
@@ -520,6 +851,25 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             bid = path.split("/")[3]
             b = BRIDGES.get(bid)
             self._send(200, {"lines": b.log()}) if b else self._send(404, {"error": "bridge not found"})
+        elif path.startswith("/api/bridge/") and path.endswith("/netlog"):
+            bid = path.split("/")[3]
+            b = BRIDGES.get(bid)
+            if not b:
+                self._send(404, {"error": "bridge not found"})
+            else:
+                qs = {}
+                if "?" in self.path:
+                    for kv in self.path.split("?", 1)[1].split("&"):
+                        if "=" in kv:
+                            k, v = kv.split("=", 1)
+                            qs[k] = v
+                try:
+                    after = int(qs.get("after", "0"))
+                except ValueError:
+                    after = 0
+                lines, total = b.netlog(after)
+                self._send(200, {"lines": lines, "after": after, "total": total,
+                                 "log_file": os.path.relpath(b.netlog_path, ROOT)})
         elif path.startswith("/api/evidence/"):
             parts = path.split("/")
             if len(parts) == 5:
