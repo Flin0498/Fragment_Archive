@@ -220,13 +220,16 @@ def gen_case(seed):
     #         判据放在哨兵行之后，界面不显示，只供本机判定。
     story = (
         "《第二章：停摆的挂钟》\n"
-        f"现场勘查图记录的事发时刻为 {pinfo['time']}，与书房挂钟停摆的那一刻相同。\n"
+        "请先回看第一章的现场勘查图，读出图上记录的事发时刻，那正是书房挂钟停摆的那一刻。\n"
         f"证物登记卡上的关键一条：{note}\n"
         "三人的说法如下：\n"
         + "\n".join(lines) + "\n"
         "其中有一人的说法被上面的物证否掉了。被物证否掉的那个人，就是真凶。\n"
     )
-    text3 = story.encode("utf-8") + "[判据] 真凶：".encode("utf-8") + murderer.encode("utf-8") + b"\n"
+    # 判据行（界面不显示，仅供本机判定）：先问答答案、后真凶
+    text3 = (story.encode("utf-8")
+             + "[判据] 问答答案：".encode("utf-8") + pinfo["time"].encode("utf-8") + b"\n"
+             + "[判据] 真凶：".encode("utf-8") + murderer.encode("utf-8") + b"\n")
 
     files = [(1, 1, 1, plan), (2, 1, 1, card), (3, 2, 2, text3)]
     return {

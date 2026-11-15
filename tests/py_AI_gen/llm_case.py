@@ -44,11 +44,14 @@ SYSTEM_PROMPT = """你是一名悬疑推理剧的"案件卷宗"编剧。你要�
 5. 至少安排一条红鲱鱼线索，把怀疑引向错误的嫌疑人。
 6. 答案（真凶身份与完整推理链）只能写在 truth 字段。case_text 中严禁出现"真凶/凶手/凶手是/真凶是/犯人是/就是凶手"等揭露性字眼，也严禁暗示最终答案；case_text 只提供可推理的事实、线索与人物表现。
 7. case_text 要长且有氛围：800~1500 字中文，包含案情通报、现场描写、死者背景、三名人物的背景与动机、完整时间线、物证清单、三人各自的口供（口吻各不相同）、以及可以推理的线索与红鲱鱼。用档案体叙事，代入感强。
+8. 设置一道章间问答题：玩家凭 case_text 与现场/证物画面能推出一个简短、唯一的事实答案。把"题干"自然写进 case_text，把简短标准答案写在 quiz_answer（只能是时间如"19:40"、1~6字短词或短语，不得是真凶姓名），case_text 正文不得直接出现该标准答案，要靠推理/读图得到。
 
 输出 JSON 结构（所有字段必填，不要缺字段）：
 {
   "title": "案件标题（4~12字，有氛围）",
   "genre": "风格（从给定钩子里的风格继承）",
+  "quiz_question": "章间问答题干（也需融入 case_text）",
+  "quiz_answer": "简短唯一标准答案（时间/短词，非真凶）",
   "victim": {"name": "死者姓名", "manner": "死因", "found": "发现地点与时间"},
   "suspects": [
     {"name": "赵枢", "relation": "与死者关系", "motive": "动机", "alibi": "不在场证明", "secret": "隐瞒的秘密", "flaw": "其说辞中可被反驳的破绽"}
@@ -113,6 +116,11 @@ def _validate(obj):
         raise ValueError(f"case_text 过短：{len(case_text)} 字")
     if not obj.get("file1_prompt") or not obj.get("file2_prompt"):
         raise ValueError("缺少 file1_prompt / file2_prompt")
+    quiz_answer = (obj.get("quiz_answer") or "").strip()
+    if not quiz_answer or len(quiz_answer) > 20:
+        raise ValueError("quiz_answer 缺失或过长")
+    if quiz_answer in SUSPECTS or quiz_answer == murderer:
+        raise ValueError("quiz_answer 不得是真凶姓名")
     if _leaks_answer(case_text, murderer):
         raise ValueError("case_text 疑似泄题")
     return obj
@@ -137,13 +145,16 @@ def _theme(seed):
     }
 
 
-def gen_case_json(seed, key, model, strict=False, tries=3):
+def gen_case_json(seed, key, model, strict=False, tries=3, genre=""):
     """生成案件剧本 dict；任何失败返回 None（调用方回退程序化模板）。
 
+    genre：可选案件类型；非空则固定风格，其余主题元素仍由种子随机。
     返回：
       {"title","murderer","case_text","file1_prompt","file2_prompt"}
     """
     t = _theme(seed)
+    if genre:
+        t["genre"] = genre
     user = (f"主题钩子：风格「{t['genre']}」，场景「{t['scene']}」，核心矛盾「{t['hook']}」，"
             f"死者身份「{t['victim']}」。请据此创作一桩完整案件。")
     last = None
@@ -159,6 +170,8 @@ def gen_case_json(seed, key, model, strict=False, tries=3):
                 "title": obj.get("title", "").strip(),
                 "murderer": murderer,
                 "case_text": obj["case_text"].strip(),
+                "quiz_question": (obj.get("quiz_question") or "").strip(),
+                "quiz_answer": obj["quiz_answer"].strip(),
                 "file1_prompt": obj["file1_prompt"].strip(),
                 "file2_prompt": obj["file2_prompt"].strip(),
             }

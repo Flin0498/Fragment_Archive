@@ -92,10 +92,24 @@ def pick(rng, lst):
     return lst[rng.randint(0, len(lst) - 1)]
 
 
-def gen_ai_images(seed, key, model, strict, p_portrait=None, p_scene=None):
+# 类型 -> 兜底场景氛围（无 LLM 剧本时让文生图也尽量呼应所选类型）
+GENRE_ROOM = {
+    "民国租界公馆": "a Republican-era concession-era mansion parlor in 1930s Shanghai",
+    "英伦庄园": "an English manor estate drawing room",
+    "蒸汽时代的实验室": "a steampunk Victorian laboratory with brass apparatus",
+    "偏远山间别墅": "a remote mountain villa on a foggy ridge",
+    "南方旧宅梅雨季": "an old southern Chinese mansion in the rainy plum season",
+    "邮轮头等舱": "a luxury ocean liner first-class cabin",
+    "赛博朋克暗巷诊所": "a cyberpunk back-alley neon clinic",
+    "雪山中的旅馆": "a snowbound mountain lodge hotel",
+}
+
+
+def gen_ai_images(seed, key, model, strict, p_portrait=None, p_scene=None, genre=""):
     if p_portrait is None or p_scene is None:   # 无剧本 prompt 时退回固定素材池（兜底）
         rng = PRNG(seed)
-        hair, coat, feat, room = pick(rng, HAIR), pick(rng, COAT), pick(rng, FEAT), pick(rng, ROOMS)
+        hair, coat, feat = pick(rng, HAIR), pick(rng, COAT), pick(rng, FEAT)
+        room = GENRE_ROOM.get(genre) or pick(rng, ROOMS)
         if p_portrait is None:
             p_portrait = (f"Detective noir character portrait of a suspect: {hair}, wearing {coat}, "
                           f"{feat}, head and shoulders, dramatic side lighting, dark background, "
@@ -127,8 +141,10 @@ def main():
     ap.add_argument("--base", default=".")
     ap.add_argument("--dotenv", default=None)
     ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--genre", default="", help="案件类型（固定风格；空则随机）")
     ap.add_argument("--preview", action="store_true", help="同时导出 file_1.jpg / file_2.jpg 便于肉眼查看")
     args = ap.parse_args()
+    genre = (args.genre or "").strip()
 
     seed = bytes.fromhex(args.seed) if args.seed else os.urandom(32)
     if len(seed) < 16:
@@ -144,7 +160,7 @@ def main():
     # 1) 优先走 LLM 剧本（需额外配置 ARK_LLM_MODEL，即 doubao 推理接入点）
     script = None
     if key and llm_model:
-        script = llm_case.gen_case_json(seed, key, llm_model, args.strict)
+        script = llm_case.gen_case_json(seed, key, llm_model, args.strict, genre=genre)
 
     murderer_name = None
     f1_prog = f2_prog = None
@@ -152,11 +168,14 @@ def main():
     f1_prompt = f2_prompt = None
 
     if script:
-        # LLM 出剧本：正文 + 文生图提示词；答案仍藏 file_3 哨兵行后
+        # LLM 出剧本：正文 + 文生图提示词；问答答案与真凶藏 file_3 哨兵行后
         murderer_name = script["murderer"]
-        f3_text = (script["case_text"].encode("utf-8")
-                   + "[判据] 真凶：".encode("utf-8")
-                   + murderer_name.encode("utf-8") + b"\n")
+        quiz_ans = (script.get("quiz_answer") or "").strip()
+        f3_text = script["case_text"].encode("utf-8")
+        if quiz_ans:
+            f3_text += "[判据] 问答答案：".encode("utf-8") + quiz_ans.encode("utf-8") + b"\n"
+        f3_text += ("[判据] 真凶：".encode("utf-8")
+                    + murderer_name.encode("utf-8") + b"\n")
         f1_prompt, f2_prompt = script["file1_prompt"], script["file2_prompt"]
         # 程序化兜底图（文生图失败时用），顺便取 session_id
         case = cc.gen_case(seed)
@@ -172,7 +191,7 @@ def main():
     # 2) 文生图渲染 file_1 / file_2
     if key and img_model:
         ai1, ai2 = gen_ai_images(seed, key, img_model, args.strict,
-                                 p_portrait=f1_prompt, p_scene=f2_prompt)
+                                 p_portrait=f1_prompt, p_scene=f2_prompt, genre=genre)
         f1 = ai1 if ai1 else f1_prog
         f2 = ai2 if ai2 else f2_prog
         mode = "llm+ai" if script else "ai"
@@ -187,11 +206,19 @@ def main():
 
     sdir = os.path.join(args.base, f"session_{sid:08x}")
     os.makedirs(sdir, exist_ok=True)
-    for fid, data in ((1, f1), (2, f2), (3, f3_text)):
-        with open(os.path.join(sdir, f"file_{fid}"), "wb") as fp:
+    # 原子落盘：先写 .tmp 再 os.replace，避免扫描/读取到生成中的残缺文件
+    def atomic(name, data):
+        tmp = os.path.join(sdir, name + ".tmp")
+        with open(tmp, "wb") as fp:
             fp.write(data)
-    with open(os.path.join(sdir, "manifest.bin"), "wb") as fp:
-        fp.write(manifest)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp, os.path.join(sdir, name))
+
+    atomic("file_1", f1)
+    atomic("file_2", f2)
+    atomic("file_3", f3_text)
+    atomic("manifest.bin", manifest)
 
     if args.preview:
         for fid, data in ((1, f1), (2, f2)):
