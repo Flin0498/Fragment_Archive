@@ -65,7 +65,13 @@ static int members(struct client *a,const unsigned char *b,size_t len,int join){
     if(join && (b[2]<1 || b[2]>4 || !(seen&(1u<<b[2]))))return -1;
     ui_state_lock(&a->ui);
     if(join){a->room_id=fa_u16(b);a->ui.room_id=a->room_id;a->ui.my_peer_id=b[2];a->ui.room_online=1;if(!a->ui.session_id)a->ui.phase=UI_PHASE_IN_ROOM;ui_set_status(&a->ui,"已进房 peer=%u",a->ui.my_peer_id);}
-    /* Keep cached peers for ongoing transfer; do not erase on Tracker loss. */
+    /* PEER_LIST/JOIN_OK 是服务器下发的权威全量名单：本次不在名单里的旧成员即已离开，
+       做差集删除，避免成员栏残留。Tracker 掉线时收不到名单，缓存自然保留，不影响在途传块。 */
+    for(unsigned i=0;i<UI_MAX_PEERS;i++){
+        if(a->ui.peers[i].used && a->ui.peers[i].peer_id!=a->ui.my_peer_id
+           && !(seen&(1u<<a->ui.peers[i].peer_id)))
+            memset(&a->ui.peers[i],0,sizeof(a->ui.peers[i]));
+    }
     for(unsigned i=0;i<count;i++)ui_set_peer(&a->ui,&list[i]);
     unsigned mine=a->ui.my_peer_id;ui_state_unlock(&a->ui);
     tr_identity(a->tr,mine,a->room_id,a->room_ip);
