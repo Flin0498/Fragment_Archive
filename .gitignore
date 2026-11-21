@@ -24,6 +24,10 @@ session_*/
 /demo.mp4
 /*.mp4
 
+# 答辩预演稿只留本机
+/docs/*.pptx
+/docs/*.pdf
+
 # 大体量实验材料
 captures/*.pcap
 captures/*.pcapng
